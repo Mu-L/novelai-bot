@@ -13,16 +13,10 @@ export const orientMap = {
   square: { height: 640, width: 640 },
 } as const
 
-const lowQuality = [
-  'nsfw, text, cropped, jpeg artifacts, signature, watermark, username, blurry',
-  'lowres, polar lores, worst quality, low quality, normal quality',
-].join(', ')
-
-const badAnatomy = [
-  'bad anatomy, error, long neck, cross-eyed, mutation, deformed',
-  'bad hands, bad feet, malformed limbs, fused fingers, mutated hands',
-  'missing fingers, fewer digits, to many fingers, extra fingers, extra digit, extra limbs, extra arms, extra legs',
-  'poorly drawn hands, poorly drawn face, poorly drawn limbs',
+const ucPreset = [
+  'nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers',
+  'extra digit, fewer digits, cropped, worst quality, low quality',
+  'normal quality, jpeg artifacts, signature, watermark, username, blurry',
 ].join(', ')
 
 type Model = keyof typeof modelMap
@@ -41,17 +35,17 @@ export namespace sampler {
   }
 
   export const sd = {
-    'k_euler_a': 'Euler ancestral',
+    'k_euler_a': 'Euler a',
     'k_euler': 'Euler',
     'k_lms': 'LMS',
     'k_heun': 'Heun',
     'k_dpm_2': 'DPM2',
-    'k_dpm_2_a': 'DPM2 ancestral',
-    'k_dpm_fast': 'DPM Fast',
+    'k_dpm_2_a': 'DPM2 a',
+    'k_dpm_fast': 'DPM fast',
     'k_dpm_ad': 'DPM adaptive',
-    'k_lms_ka': 'LMS karras',
-    'k_dpm_2_ka': 'DPM2 karras',
-    'k_dpm_2_a_ka': 'DPM2 ancestral karras',
+    'k_lms_ka': 'LMS Karras',
+    'k_dpm_2_ka': 'DPM2 Karras',
+    'k_dpm_2_a_ka': 'DPM2 a Karras',
     'ddim': 'DDIM',
     'plms': 'PLMS',
   }
@@ -72,7 +66,7 @@ export namespace sampler {
 export interface Options {
   enhance: boolean
   model: string
-  viewport: Size
+  resolution: Size
   sampler: string
   seed: string
   steps: number
@@ -81,20 +75,28 @@ export interface Options {
   strength: number
 }
 
-export interface Config {
-  type: 'token' | 'login' | 'naifu' | 'sd-webui'
-  token: string
-  email: string
-  password: string
-  model?: Model
-  orient?: Orient
-  sampler?: string
-  anatomy?: boolean
-  output?: 'minimal' | 'default' | 'verbose'
-  allowAnlas?: boolean | number
+export interface PromptConfig {
   basePrompt?: string
   negativePrompt?: string
   forbidden?: string
+  placement?: 'before' | 'after'
+  latinOnly?: boolean
+  maxWords?: number
+}
+
+export interface Config extends PromptConfig {
+  type: 'token' | 'login' | 'naifu' | 'sd-webui'
+  token?: string
+  email?: string
+  password?: string
+  model?: Model
+  orient?: Orient
+  sampler?: string
+  maxSteps?: number
+  maxResolution?: number
+  anatomy?: boolean
+  output?: 'minimal' | 'default' | 'verbose'
+  allowAnlas?: boolean | number
   endpoint?: string
   headers?: Dict<string>
   maxRetryCount?: number
@@ -122,8 +124,8 @@ export const Config = Schema.intersect([
         }),
         Schema.object({
           type: Schema.const('login'),
-          email: Schema.string().description('用户名。').required(),
-          password: Schema.string().description('密码。').role('secret').required(),
+          email: Schema.string().description('账号邮箱。').required(),
+          password: Schema.string().description('账号密码。').role('secret').required(),
         }),
       ]),
       Schema.object({
@@ -156,32 +158,46 @@ export const Config = Schema.intersect([
     Schema.object({
       type: Schema.const('sd-webui'),
       sampler: sampler.createSchema(sampler.sd),
-    }).description('功能设置'),
+    }).description('参数设置'),
     Schema.object({
       type: Schema.const('naifu'),
       sampler: sampler.createSchema(sampler.nai),
-    }).description('功能设置'),
+    }).description('参数设置'),
     Schema.object({
       model: Schema.union(models).description('默认的生成模型。').default('nai'),
       sampler: sampler.createSchema(sampler.nai),
-    }).description('功能设置'),
+    }).description('参数设置'),
   ] as const),
 
   Schema.object({
     orient: Schema.union(orients).description('默认的图片方向。').default('portrait'),
+    maxSteps: Schema.natural().description('允许的最大迭代步数。').default(0),
+    maxResolution: Schema.natural().description('生成图片的最大尺寸。').default(0),
+  }),
+
+  Schema.object({
+    basePrompt: Schema.string().role('textarea').description('默认附加的标签。').default('masterpiece, best quality'),
+    negativePrompt: Schema.string().role('textarea').description('默认附加的反向标签。').default(ucPreset),
+    forbidden: Schema.string().role('textarea').description('违禁词列表。含有违禁词的请求将被拒绝。').default(''),
+    placement: Schema.union([
+      Schema.const('before' as const).description('置于最前'),
+      Schema.const('after' as const).description('置于最后'),
+    ]).description('默认附加标签的位置。').default('after'),
+    latinOnly: Schema.boolean().description('是否只接受英文输入。').default(false),
+    maxWords: Schema.natural().description('允许的最大单词数量。').default(0),
+  }).description('输入设置'),
+
+  Schema.object({
     output: Schema.union([
       Schema.const('minimal').description('只发送图片'),
       Schema.const('default').description('发送图片和关键信息'),
       Schema.const('verbose').description('发送全部信息'),
     ]).description('输出方式。').default('default'),
-    basePrompt: Schema.string().role('textarea').description('默认附加的标签。').default('masterpiece, best quality'),
-    negativePrompt: Schema.string().role('textarea').description('默认附加的反向标签。').default([lowQuality, badAnatomy].join(', ')),
-    forbidden: Schema.string().role('textarea').description('违禁词列表。含有违禁词的请求将被拒绝。').default(''),
     maxRetryCount: Schema.natural().description('连接失败时最大的重试次数。').default(3),
     requestTimeout: Schema.number().role('time').description('当请求超过这个时间时会中止并提示超时。').default(Time.minute),
     recallTimeout: Schema.number().role('time').description('图片发送后自动撤回的时间 (设置为 0 以禁用此功能)。').default(0),
     maxConcurrency: Schema.number().description('单个频道下的最大并发数量 (设置为 0 以禁用此功能)。').default(0),
-  }),
+  }).description('高级设置'),
 ]) as Schema<Config>
 
 interface Forbidden {
@@ -205,7 +221,7 @@ export function parseForbidden(input: string) {
 
 const backslash = /@@__BACKSLASH__@@/g
 
-export function parseInput(input: string, config: Config, forbidden: Forbidden[]): string[] {
+export function parseInput(input: string, config: Config, forbidden: Forbidden[], override: boolean): string[] {
   input = input.toLowerCase()
     .replace(/\\\\/g, backslash.source)
     .replace(/，/g, ',')
@@ -214,32 +230,39 @@ export function parseInput(input: string, config: Config, forbidden: Forbidden[]
 
   if (config.type === 'sd-webui') {
     input = input
-      .replace(/(^|[^\\])\{/g, (_, $1) => $1 + '(')
-      .replace(/(^|[^\\])\}/g, (_, $1) => $1 + ')')
+      .split('\\{').map(s => s.replace(/\{/g, '(')).join('\\{')
+      .split('\\}').map(s => s.replace(/\}/g, ')')).join('\\}')
   } else {
     input = input
-      .replace(/(^|[^\\])\(/g, (_, $1) => $1 + '{')
-      .replace(/(^|[^\\])\)/g, (_, $1) => $1 + '}')
+      .split('\\(').map(s => s.replace(/\(/g, '{')).join('\\(')
+      .split('\\)').map(s => s.replace(/\)/g, '}')).join('\\)')
   }
 
   input = input
     .replace(backslash, '\\')
     .replace(/_/g, ' ')
 
-  if (/[^\s\w"'“”‘’.,:|\\()\[\]{}-]/.test(input)) {
-    return ['.invalid-input']
+  if (config.latinOnly && /[^\s\w"'“”‘’.,:|\\()\[\]{}-]/.test(input)) {
+    return ['.latin-only']
   }
 
   const negative = []
   const appendToList = (words: string[], input: string) => {
-    for (let tag of input.split(/,\s*/g)) {
+    const tags = input.split(/,\s*/g)
+    if (config.placement === 'before') tags.reverse()
+    for (let tag of tags) {
       tag = tag.trim().toLowerCase()
-      if (tag && !words.includes(tag)) words.push(tag)
+      if (!tag || words.includes(tag)) continue
+      if (config.placement === 'before') {
+        words.unshift(tag)
+      } else {
+        words.push(tag)
+      }
     }
   }
 
   // extract negative prompts
-  const capture = input.match(/(,\s*|\s+)(-u\s+|negative prompts?:)\s*([\s\S]+)/m)
+  const capture = input.match(/(,\s*|\s+)(-u\s+|--undesired\s+|negative prompts?:\s*)([\s\S]+)/m)
   if (capture?.[3]) {
     input = input.slice(0, capture.index).trim()
     appendToList(negative, capture[3])
@@ -259,7 +282,18 @@ export function parseInput(input: string, config: Config, forbidden: Forbidden[]
     return true
   })
 
-  appendToList(positive, config.basePrompt)
-  appendToList(negative, config.negativePrompt)
+  if (Math.max(getWordCount(positive), getWordCount(negative)) > (config.maxWords || Infinity)) {
+    return ['.too-many-words']
+  }
+
+  if (!override) {
+    appendToList(positive, config.basePrompt)
+    appendToList(negative, config.negativePrompt)
+  }
+
   return [null, positive.join(', '), negative.join(', ')]
+}
+
+function getWordCount(words: string[]) {
+  return words.join(' ').replace(/[^a-z0-9]+/g, ' ').trim().split(' ').length
 }

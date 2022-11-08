@@ -1,7 +1,7 @@
 import { Context, Dict, Logger, omit, Quester, segment, Session, trimSlash } from 'koishi'
 import { Config, modelMap, models, orientMap, parseForbidden, parseInput, sampler } from './config'
 import { StableDiffusionWebUI } from './types'
-import { download, getImageSize, login, NetworkError, project, resizeInput, Size } from './utils'
+import { closestMultiple, download, getImageSize, login, NetworkError, project, resizeInput, Size, stripDataPrefix } from './utils'
 import {} from '@koishijs/plugin-help'
 
 export * from './config'
@@ -61,12 +61,23 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  const viewport = (source: string, session: Session<'authority'>): Size => {
+  const step = (source: string) => {
+    const value = +source
+    if (value * 0 === 0 && Math.floor(value) === value && value > 0 && value <= (config.maxSteps || Infinity)) return value
+    throw new Error()
+  }
+
+  const resolution = (source: string, session: Session<'authority'>): Size => {
     if (source in orientMap) return orientMap[source]
     if (restricted(session)) throw new Error()
     const cap = source.match(/^(\d+)[x×](\d+)$/)
     if (!cap) throw new Error()
-    return { width: +cap[1], height: +cap[2] }
+    const width = closestMultiple(+cap[1])
+    const height = closestMultiple(+cap[2])
+    if (Math.max(width, height) > (config.maxResolution || Infinity)) {
+      throw new Error()
+    }
+    return { width, height }
   }
 
   const cmd = ctx.command('novelai <prompts:text>')
@@ -80,10 +91,11 @@ export function apply(ctx: Context, config: Config) {
     .shortcut('增強', { fuzzy: true, options: { enhance: true } })
     .option('enhance', '-e', { hidden: restricted })
     .option('model', '-m <model>', { type: models, hidden: thirdParty })
-    .option('viewport', '-o, -v <viewport>', { type: viewport })
+    .option('resolution', '-r <resolution>', { type: resolution })
+    .option('override', '-O')
     .option('sampler', '-s <sampler>')
     .option('seed', '-x <seed:number>')
-    .option('steps', '-t <step:number>', { hidden: restricted })
+    .option('steps', '-t <step>', { type: step, hidden: restricted })
     .option('scale', '-c <scale:number>')
     .option('noise', '-n <noise:number>', { hidden: restricted })
     .option('strength', '-N <strength:number>', { hidden: restricted })
@@ -112,7 +124,7 @@ export function apply(ctx: Context, config: Config) {
         delete options.steps
       }
 
-      const [errPath, prompt, uc] = parseInput(input, config, forbidden)
+      const [errPath, prompt, uc] = parseInput(input, config, forbidden, options.override)
       if (errPath) return session.text(errPath)
 
       let token: string
@@ -134,7 +146,11 @@ export function apply(ctx: Context, config: Config) {
         prompt,
         n_samples: 1,
         uc,
-        ucPreset: 0,
+        // 0: low quality + bad anatomy
+        // 1: low quality
+        // 2: none
+        ucPreset: 2,
+        qualityToggle: false,
       }
 
       if (imgUrl) {
@@ -149,13 +165,13 @@ export function apply(ctx: Context, config: Config) {
           return session.text('.download-error')
         }
 
-        const size = getImageSize(image[0])
         Object.assign(parameters, {
           image: image[1],
           scale: options.scale ?? 11,
           steps: options.steps ?? 50,
         })
         if (options.enhance) {
+          const size = getImageSize(image[0])
           if (size.width + size.height !== 1280) {
             return session.text('.invalid-size')
           }
@@ -166,22 +182,21 @@ export function apply(ctx: Context, config: Config) {
             strength: options.strength ?? 0.2,
           })
         } else {
-          const orient = resizeInput(size)
+          options.resolution ||= resizeInput(getImageSize(image[0]))
           Object.assign(parameters, {
-            height: orient.height,
-            width: orient.width,
+            height: options.resolution.height,
+            width: options.resolution.width,
             noise: options.noise ?? 0.2,
             strength: options.strength ?? 0.7,
           })
         }
       } else {
+        options.resolution ||= orientMap[config.orient]
         Object.assign(parameters, {
-          height: options.viewport.height,
-          width: options.viewport.width,
-          scale: options.scale ?? 12,
+          height: options.resolution.height,
+          width: options.resolution.width,
+          scale: options.scale ?? 11,
           steps: options.steps ?? 28,
-          noise: options.noise ?? 0.2,
-          strength: options.strength ?? 0.7,
         })
       }
 
@@ -195,8 +210,8 @@ export function apply(ctx: Context, config: Config) {
         }
       }
 
-      session.send(globalTasks.size > 1
-        ? session.text('.pending', [globalTasks.size - 1])
+      session.send(globalTasks.size
+        ? session.text('.pending', [globalTasks.size])
         : session.text('.waiting'))
 
       globalTasks.add(id)
@@ -205,30 +220,41 @@ export function apply(ctx: Context, config: Config) {
         globalTasks.delete(id)
       }
 
-      function getPostData() {
+      const path = (() => {
+        switch (config.type) {
+          case 'sd-webui':
+            return parameters.image ? '/sdapi/v1/img2img' : '/sdapi/v1/txt2img'
+          case 'naifu':
+            return '/generate-stream'
+          default:
+            return '/ai/generate-image'
+        }
+      })()
+
+      const data = (() => {
         if (config.type !== 'sd-webui') {
           parameters.sampler = sampler.sd2nai(options.sampler)
-          return config.type === 'naifu'
-            ? parameters
-            : { model, input, parameters: omit(parameters, ['prompt']) }
+          if (config.type === 'naifu') return parameters
+          return { model, input: prompt, parameters: omit(parameters, ['prompt']) }
         }
 
         return {
           sampler_index: sampler.sd[options.sampler],
+          init_images: parameters.image && [parameters.image],
           ...project(parameters, {
             prompt: 'prompt',
-            n_samples: 'n_samples',
+            batch_size: 'n_samples',
             seed: 'seed',
             negative_prompt: 'uc',
             cfg_scale: 'scale',
             steps: 'steps',
             width: 'width',
             height: 'height',
+            denoising_strength: 'strength',
           }),
         }
-      }
+      })()
 
-      const path = config.type === 'sd-webui' ? '/sdapi/v1/txt2img' : config.type === 'naifu' ? '/generate-stream' : '/ai/generate-image'
       const request = () => ctx.http.axios(trimSlash(config.endpoint) + path, {
         method: 'POST',
         timeout: config.requestTimeout,
@@ -236,15 +262,15 @@ export function apply(ctx: Context, config: Config) {
           ...config.headers,
           authorization: 'Bearer ' + token,
         },
-        data: getPostData(),
+        data,
       }).then((res) => {
         if (config.type === 'sd-webui') {
-          return (res.data as StableDiffusionWebUI.Response).images[0]
+          return stripDataPrefix((res.data as StableDiffusionWebUI.Response).images[0])
         }
         // event: newImage
         // id: 1
         // data:
-        return res.data.slice(27)
+        return res.data?.slice(27)
       })
 
       let base64: string, count = 0
@@ -312,7 +338,6 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.accept(['model', 'orient', 'sampler'], (config) => {
     cmd._options.model.fallback = config.model
-    cmd._options.viewport.fallback = config.orient
     cmd._options.sampler.fallback = config.sampler
     cmd._options.sampler.type = Object.keys(config.type === 'sd-webui' ? sampler.sd : sampler.nai)
   }, { immediate: true })
